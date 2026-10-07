@@ -9,7 +9,7 @@
 ![Horizons](https://img.shields.io/badge/Horizons-1_to_24_h-1F3864?style=for-the-badge)
 ![Models](https://img.shields.io/badge/Models-6-2E5FD9?style=for-the-badge)
 ![CLI commands](https://img.shields.io/badge/CLI_commands-6-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-26_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-25_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -106,7 +106,7 @@ skyfusion gives each of these questions its own component. Each component has un
 | Providers | NASA POWER API (optional download), PyTorch (optional LSTM) |
 | Offline mode | Synthetic files in both raw formats, all loaders, all baselines, ridge and boosting |
 | Safety | One UTC index. The target is never averaged and never filled. No sample crosses a split boundary |
-| Tests | **26** unit tests (`pytest`). In CI, 25 pass and 1 skips (PyTorch is not in the `dev` extra) |
+| Tests | **25** pass in CI (`.[dev]` only) and 1 skips (`lstm` extra). With the `lstm` extra, all 26 pass |
 
 ```mermaid
 flowchart LR
@@ -153,7 +153,7 @@ skyfusion/
 ├── data/README.md             # sources, terms, columns (data files are git-ignored)
 ├── docs/ste-style-guide.md    # writing rules and project vocabulary
 ├── src/skyfusion/             # the 9 modules in 2.1
-├── tests/                     # 26 unit tests, synthetic data only
+├── tests/                     # 26 unit tests (1 needs the lstm extra), synthetic data only
 ├── .env.example               # variable names only
 └── pyproject.toml             # core deps: numpy, pandas, scikit-learn, pydantic. Extras: lstm, dev
 ```
@@ -416,7 +416,7 @@ All numbers come from synthetic data (2018 to 2022, one hidden truth). They are 
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **26 passed** (local). Expected CI: 25 passed, 1 skipped (PyTorch) | `pytest -q` |
+| Unit tests | CI installs only `.[dev]`: **25 passed**, 1 skipped (`lstm` extra, PyTorch). With the extras: 26 passed | `pytest -q` |
 | UTC alignment | Station and POWER temperatures correlate best at lag 0 | `pytest tests/test_ingest_fuse.py` |
 | Data | 43,824 hours, 549 hours without a station temperature (1 % random gaps and a 5-day outage) | `skyfusion build-dataset` |
 
@@ -475,7 +475,7 @@ Read these problems before you use skyfusion in production.
 3. **No future values.** Features fill only forward, the target never, and an embargo separates the splits.
 4. **Direct 24-hour forecasts.** Each horizon has its own scored output, with no recursive loop.
 5. **Baselines and a fair ablation.** Skill is relative to persistence, and the two feature sets use identical samples.
-6. **Everything runs offline.** The synthetic files use the real raw formats, and the 26 tests need no network.
+6. **Everything runs offline.** The synthetic files use the real raw formats, and the 25 CI tests need no network.
 
 ---
 
