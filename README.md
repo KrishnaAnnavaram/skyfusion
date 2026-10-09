@@ -70,6 +70,7 @@ This README is the **one location that explains all of skyfusion**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one forecast](#42-the-life-cycle-of-one-forecast)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Ingestion and UTC alignment](#5-ingestion-and-utc-alignment)
 6. 🟢 [Quality control and fusion](#6-quality-control-and-fusion)
 7. 🟣 [Samples, split and models](#7-samples-split-and-models)
@@ -133,6 +134,39 @@ flowchart LR
 | Evaluation | `src/skyfusion/evaluate.py` | MAE, RMSE, skill, ablation with a day-block bootstrap |
 | CLI | `src/skyfusion/cli.py` | The `skyfusion` command with 6 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>skyfusion command"]
+    CFG["config.py<br/>Settings"]
+    subgraph DATA["Data in"]
+        SYN["synthetic.py<br/>write_synthetic"]
+        ING["ingest.py<br/>read_power_csv, fetch_power,<br/>read_openweather_csv"]
+        FUS["fuse.py<br/>build_dataset, feature_sets"]
+    end
+    subgraph LEARN["Samples and models"]
+        WIN["windows.py<br/>make_samples, split_by_year"]
+        MOD["models.py<br/>baselines, RidgeDirect, GBMDirect"]
+        LST["lstm.py<br/>LSTMDirect, extra lstm"]
+        EVA["evaluate.py<br/>run_experiment"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> ING
+    CLI --> FUS
+    CLI --> EVA
+    CLI -- "forecast" --> WIN
+    CLI -- "forecast" --> MOD
+    EVA --> FUS
+    EVA --> WIN
+    EVA --> MOD
+    EVA -- "--lstm" --> LST
+    LST --> MOD
+    MOD --> WIN
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -165,6 +199,19 @@ skyfusion/
 ### 3.1 One time standard: UTC
 Each loader returns a timezone-aware UTC index. An LST POWER file is shifted by `round(lon / 15)` hours (−6 h at lon −97.04). `build_dataset` rejects a table without a UTC index. A test checks that the two temperatures agree best at lag 0, not at lag 6.
 
+```mermaid
+flowchart LR
+    PF[/"POWER file<br/>YEAR, MO, DY, HR"/] --> STD{"Header says<br/>in LST or in UTC?"}
+    STD -- "LST" --> SH["UTC = local time minus<br/>round of lon / 15 hours.<br/>lon −97.04: plus 6 h"]
+    STD -- "UTC" --> NO["No shift"]
+    STD -- "neither" --> ERR[/"IngestError"/]
+    SH --> UTC[("One UTC hourly grid")]
+    NO --> UTC
+    OW[/"OpenWeather file<br/>dt in Unix seconds"/] --> UTC
+    UTC --> CHK{"build_dataset:<br/>each index is UTC?"}
+    CHK -- "no" --> ERR2[/"ValueError"/]
+```
+
 ### 3.2 Fuse only the same quantity
 Relative humidity at 2 m, precipitation and surface pressure can be averaged. Sea-level pressure and surface pressure are different, and wind at 10 m and wind at 2 m are different. These columns stay separate.
 
@@ -190,25 +237,62 @@ Imputation and scaling are steps of an sklearn `Pipeline`, fit on the train samp
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    OW["OpenWeather CSV: dt (UTC), kelvin, hPa"] --> S["read_openweather_csv: C, kPa, sea level vs surface"]
-    PW["POWER CSV: LST header, -999"] --> P["read_power_csv: UTC shift, NaN"]
-    API["POWER API (time-standard=UTC)"] --> P
-    S --> G["UTC hourly grid"]
+flowchart TD
+    OW[/"OpenWeather CSV: dt in UTC,<br/>kelvin, hPa"/] --> S["read_openweather_csv:<br/>°C, kPa, sea level and surface apart"]
+    PW[/"POWER CSV: LST header, -999"/] --> P["read_power_csv:<br/>UTC shift, -999 to NaN"]
+    API[/"POWER API<br/>time-standard=UTC"/] --> CA[("cache/<br/>power_lat_lon_start_end_UTC.csv")]
+    CA --> P
+    S --> G["build_dataset:<br/>UTC hourly grid, common range"]
     P --> G
-    G --> Q["Quality control: physical limits"]
-    Q --> F["Fusion rules: fz_rh, fz_rain, fz_sfc"]
-    F --> M["Forward fill (3 h) + mask columns"]
-    M --> W["Samples: window 24 h, targets t+1..t+24"]
-    W --> SP["Split by year + embargo"]
-    SP --> B["Baselines"]
-    SP --> L["Ridge, boosting, LSTM"]
-    B --> E["MAE, RMSE, skill per horizon"]
+    G --> Q["Quality control:<br/>physical limits to NaN"]
+    Q --> F["Fusion rules:<br/>fz_rh_pct, fz_rain_mm, fz_sfc_kpa"]
+    F --> M["Forward fill 3 h<br/>+ mask columns, target not filled"]
+    M --> FT[("data/fused.csv")]
+    FT --> W["make_samples: window 24 h,<br/>targets t+1 to t+24"]
+    W --> SP["split_by_year + embargo"]
+    SP --> B["Baselines: persistence,<br/>seasonal-naive, climatology"]
+    SP --> L["ridge, gbm, lstm<br/>station and fused features"]
+    B --> E["MAE, RMSE, skill<br/>for each horizon"]
     L --> E
-    E --> A["Ablation: fused - station"]
+    E --> A[/"Ablation: RMSE fused minus station,<br/>day-block bootstrap interval"/]
+    A --> HUMAN{{"HUMAN<br/>analyst reads skill and ablation<br/>before a feature set is used"}}
+    FT --> FC[/"forecast: ridge,<br/>next 24 hours"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one forecast
+
+```mermaid
+stateDiagram-v2
+    state "Raw rows in two files" as Raw
+    state "Hour on the UTC grid" as Grid
+    state "Checked hour" as Checked
+    state "Filled features and masks" as Filled
+    state "Candidate origin t" as Candidate
+    state "Sample: window and 24 targets" as Sample
+    state "Removed by the embargo" as Embargoed
+    state "Train or validation sample" as Fit
+    state "Test sample" as Test
+    state "Forecast for 24 horizons" as Forecast
+    [*] --> Raw
+    Raw --> Grid: loaders, LST shifted to UTC
+    Grid --> Checked: values outside limits to NaN
+    Checked --> Filled: fusion rules, forward fill 3 h
+    Filled --> Candidate: make_samples
+    Candidate --> Dropped: target at t or a future target missing
+    Candidate --> Sample: all targets present
+    Sample --> Embargoed: last target in the next part
+    Sample --> Fit: origin year up to SKYFUSION_VAL_END
+    Sample --> Test: origin year after SKYFUSION_VAL_END
+    Fit --> [*]: fit on train, select on validation
+    Test --> Forecast: predict change, add last value
+    Forecast --> Scored: MAE, RMSE, skill
+    Scored --> [*]
+    Dropped --> [*]
+    Embargoed --> [*]
+```
 
 1. Read the station file and change kelvin to °C and hPa to kPa.
 2. Read the POWER file, shift LST to UTC and change `-999` to NaN.
@@ -219,11 +303,93 @@ flowchart TB
 7. Predict the change from the last observed temperature for all 24 horizons.
 8. Add the last observed temperature to get the forecast.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as skyfusion CLI
+    participant ING as ingest.py
+    participant NASA as NASA POWER API
+    participant FUS as fuse.build_dataset
+    participant EVA as evaluate.run_experiment
+    participant WIN as windows.py
+    participant MOD as Models
+
+    A->>CLI: skyfusion fetch-power --start --end
+    CLI->>ING: fetch_power(lat, lon, start, end, cache_dir)
+    ING->>NASA: GET hourly point, format CSV, time-standard UTC
+    NASA-->>ING: CSV text, or JSON error
+    ING-->>CLI: UTC table, file in cache/
+    A->>CLI: skyfusion build-dataset --station --power --out
+    CLI->>ING: read_openweather_csv, read_power_files
+    ING-->>CLI: two UTC tables in SI units
+    CLI->>FUS: build_dataset(station, power)
+    FUS-->>CLI: fused table and QCReport
+    CLI-->>A: data/fused.csv
+    A->>CLI: skyfusion evaluate --dataset data/fused.csv
+    CLI->>EVA: run_experiment(df, window, horizon, years)
+    EVA->>WIN: make_samples and split_by_year, station and fused
+    loop each feature set and each model
+        EVA->>MOD: fit(train, val)
+        EVA->>MOD: predict(test)
+        MOD-->>EVA: 24 forecasts for each sample
+    end
+    EVA->>EVA: add_skill, block_bootstrap_diff
+    EVA-->>CLI: rows and ablation
+    CLI-->>A: MAE and skill table, ablation intervals
+```
+
 ---
 
 ## 5. Ingestion and UTC alignment
 
 **Purpose.** Read each source in its real format and return SI units on a UTC index.
+
+```mermaid
+flowchart TD
+    TXT[/"POWER CSV text"/] --> HDR["_split_header:<br/>text before -END HEADER-"]
+    HDR --> STD{"time_standard given,<br/>or header says LST or UTC?"}
+    STD -- "no" --> E1[/"IngestError"/]
+    STD -- "yes" --> COLS{"YEAR, MO, DY, HR<br/>columns present?"}
+    COLS -- "no" --> E2[/"IngestError: columns missing"/]
+    COLS -- "yes" --> SHIFT["Local time minus offset:<br/>round of lon / 15 for LST, 0 for UTC"]
+    SHIFT --> FILL["-999 to NaN"]
+    FILL --> DUP["Drop duplicate hours,<br/>sort by time"]
+    DUP --> OUT[/"POWER table, UTC index"/]
+```
+
+`fetch_power()` downloads one POWER request in UTC and keeps it in the cache.
+
+```mermaid
+flowchart TD
+    REQ[/"lat, lon, start, end<br/>YYYYMMDD"/] --> KEY["Cache file name:<br/>power_lat_lon_start_end_UTC.csv"]
+    KEY --> HIT{"File in<br/>SKYFUSION_CACHE_DIR?"}
+    HIT -- "yes" --> READ["read_power_csv,<br/>time standard UTC"]
+    HIT -- "no" --> GET["GET power_url: 7 parameters,<br/>format CSV, time-standard UTC,<br/>timeout 120 s"]
+    GET --> JS{"Answer starts<br/>with a JSON object?"}
+    JS -- "yes" --> ERR[/"IngestError with the API messages,<br/>no cache file"/]
+    JS -- "no" --> SAVE["Write the cache file"]
+    SAVE --> READ
+    READ --> OUT[/"POWER table, UTC index"/]
+```
+
+`read_openweather_csv()` changes the station export to SI units.
+
+```mermaid
+flowchart LR
+    CSV[/"OpenWeather History Bulk CSV"/] --> T{"dt or dt_iso?"}
+    T -- "dt" --> UX["Unix seconds to UTC"]
+    T -- "dt_iso only" --> ISO["Parse the ISO text as UTC"]
+    T -- "neither" --> ERR[/"IngestError"/]
+    UX --> CONV["temp, dew_point, feels_like:<br/>kelvin minus 273.15"]
+    ISO --> CONV
+    CONV --> PR["pressure to slp_kpa,<br/>grnd_level to sfc_kpa, hPa / 10"]
+    PR --> MAP["humidity, wind_speed,<br/>rain_1h, clouds_all renamed"]
+    MAP --> RAIN["Empty rain_mm to 0"]
+    RAIN --> OUT[/"Station table, UTC index"/]
+```
 
 | Source | Time | Conversion |
 |---|---|---|
@@ -251,6 +417,23 @@ flowchart TB
 
 **Purpose.** Make one clean table with the target, the features and the masks.
 
+```mermaid
+flowchart TD
+    ST[/"Station table"/] --> UTC{"Both indexes<br/>timezone-aware UTC?"}
+    PW[/"POWER table, optional"/] --> UTC
+    UTC -- "no" --> ERR[/"ValueError"/]
+    UTC -- "yes" --> PFX["st_ prefix, drop st_temp_min_c<br/>and st_temp_max_c. POWER names to pw_"]
+    PFX --> GRID["Hourly UTC grid over the<br/>range that both sources cover"]
+    GRID --> QC["_qc: value outside LIMITS<br/>to NaN, count each column"]
+    QC --> TM["Count the hours with<br/>no st_temp_c"]
+    TM --> FZ["FUSION_RULES: mean of the<br/>available station and POWER values"]
+    FZ --> GAP{"Feature column<br/>has gaps?"}
+    GAP -- "yes" --> MASK["Add the _missing mask,<br/>ffill with limit 3"]
+    GAP -- "no" --> TGT
+    MASK --> TGT["target_temp_c = st_temp_c,<br/>not filled"]
+    TGT --> OUT[/"Fused table and QCReport"/]
+```
+
 **Procedure**
 
 1. Prefix the station columns with `st_` and the POWER columns with `pw_`.
@@ -270,6 +453,35 @@ flowchart TB
 
 Not fused: `st_slp_kpa` with `pw_sfc_kpa` (sea level against surface), `st_wind10_ms` with `pw_wind2_ms` (10 m against 2 m), and `st_temp_c` with `pw_t2m_c` (the target).
 
+```mermaid
+flowchart LR
+    subgraph ST["Station columns"]
+        SRH["st_rh_pct"]
+        SRA["st_rain_mm"]
+        SSF["st_sfc_kpa<br/>only with grnd_level"]
+        SSL["st_slp_kpa"]
+        SWI["st_wind10_ms"]
+        STE["st_temp_c"]
+    end
+    subgraph PWC["POWER columns"]
+        PRH["pw_rh_pct"]
+        PRA["pw_rain_mm"]
+        PSF["pw_sfc_kpa"]
+        PWI["pw_wind2_ms"]
+        PTE["pw_t2m_c"]
+    end
+    SRH --> FRH["fz_rh_pct"]
+    PRH --> FRH
+    SRA --> FRA["fz_rain_mm"]
+    PRA --> FRA
+    SSF --> FSF["fz_sfc_kpa"]
+    PSF --> FSF
+    STE --> TGT[("target_temp_c<br/>never averaged")]
+    SSL -. "not fused" .- PSF
+    SWI -. "not fused" .- PWI
+    STE -. "not fused" .- PTE
+```
+
 **Physical limits**
 
 | Quantity | Limits |
@@ -287,6 +499,36 @@ Not fused: `st_slp_kpa` with `pw_sfc_kpa` (sea level against surface), `st_wind1
 ## 7. Samples, split and models
 
 **Purpose.** Train and score models on samples that do not leak across time.
+
+```mermaid
+flowchart TD
+    DF[/"Fused table and a feature set:<br/>station or fused"/] --> REG{"target_temp_c present and<br/>a regular hourly grid?"}
+    REG -- "no" --> ERR[/"KeyError or ValueError"/]
+    REG -- "yes" --> POS["Origins t from hour W-1<br/>to the last hour minus H"]
+    POS --> WIN["sliding_window_view:<br/>X_seq hours t-23 to t,<br/>y_hist, Y hours t+1 to t+24"]
+    WIN --> OK{"Target at t and<br/>all H targets present?"}
+    OK -- "no" --> DROP["Drop the origin"]
+    OK -- "yes" --> CAL["Calendar: hour and day-of-year,<br/>sine and cosine"]
+    CAL --> S[/"Samples: origins, X_seq,<br/>calendar, y_hist, Y"/]
+```
+
+The diagram shows how `split_by_year()` puts each sample in one part.
+
+```mermaid
+flowchart TD
+    S[/"Sample with origin t"/] --> Y{"Year of t"}
+    Y -- "up to SKYFUSION_TRAIN_END" --> E1{"Last target hour t+H<br/>also in a train year?"}
+    E1 -- "yes" --> TR[/"train"/]
+    E1 -- "no" --> EMB[/"Removed: embargo"/]
+    Y -- "up to SKYFUSION_VAL_END" --> E2{"Last target hour t+H<br/>also in a validation year?"}
+    E2 -- "yes" --> VA[/"validation"/]
+    E2 -- "no" --> EMB
+    Y -- "later" --> TE[/"test"/]
+    TR --> CHK{"A part is empty?"}
+    VA --> CHK
+    TE --> CHK
+    CHK -- "yes" --> ERR[/"ValueError: empty split"/]
+```
 
 **Procedure**
 
@@ -310,6 +552,40 @@ Not fused: `st_slp_kpa` with `pw_sfc_kpa` (sea level against surface), `st_wind1
 
 The ablation trains `ridge`, `gbm` and `lstm` two times: with the `station` feature set and with the `fused` feature set. The samples, origins and targets are identical.
 
+The learned models predict the change from the last observed temperature. Each one uses the validation samples in a different way.
+
+```mermaid
+flowchart TD
+    TR[/"Train samples"/] --> R["Change targets:<br/>Y minus last observed value"]
+    R --> M{"Model"}
+    M -- "ridge" --> RP["For each alpha in 0.1, 1, 10, 100:<br/>median imputer, scaler, ridge<br/>on the flat 24 h window"]
+    RP --> RS["Keep the alpha with the<br/>lowest validation RMSE"]
+    M -- "gbm" --> GP["For each horizon: boosting on<br/>the last 6 hours, 150 iterations"]
+    GP --> GS["staged_predict on validation:<br/>keep the best iteration count"]
+    M -- "lstm" --> LP["Train medians and scaling,<br/>missing flags, calendar.<br/>LSTM 64 units, linear head"]
+    LP --> LS["Early stopping on validation loss,<br/>patience 4, keep the best weights"]
+    RS --> P["predict: change + last<br/>observed value"]
+    GS --> P
+    LS --> P
+    P --> OUT[/"24 forecasts for each test sample"/]
+```
+
+`run_experiment()` runs the comparison on the same test samples.
+
+```mermaid
+flowchart LR
+    DF[/"Fused table"/] --> FS["feature_sets:<br/>station, fused"]
+    FS --> SM["make_samples and<br/>split_by_year for each set"]
+    SM --> SAME{"Same test origins<br/>in both sets?"}
+    SAME -- "no" --> ERR[/"AssertionError"/]
+    SAME -- "yes" --> ST["station: 3 baselines,<br/>ridge, gbm, lstm with --lstm"]
+    SAME -- "yes" --> FU["fused: ridge, gbm,<br/>lstm with --lstm"]
+    ST --> SC["score: MAE, RMSE<br/>for each horizon"]
+    FU --> SC
+    SC --> SK["add_skill"]
+    SK --> AB[/"Ablation at h = 1, 6, 24,<br/>or h = 1 and H if H below 24"/]
+```
+
 ---
 
 ## 8. The decision rules
@@ -325,6 +601,19 @@ The ablation trains `ridge`, `gbm` and `lstm` two times: with the `station` feat
 | LST offset | round(lon / 15) hours | `Settings.lst_offset_hours`, `parse_power_text` |
 | Skill | 1 − RMSE / RMSE of persistence, at each horizon | `evaluate.add_skill` |
 | Ablation interval | 500 resamples of whole days, 95 % percentile | `block_bootstrap_diff` |
+
+The diagram shows how skill and the ablation interval are calculated.
+
+```mermaid
+flowchart LR
+    P[/"Test predictions of<br/>each model and feature set"/] --> RM["RMSE at each horizon"]
+    PE[/"persistence RMSE,<br/>station features"/] --> SK["skill = 1 − RMSE /<br/>RMSE of persistence"]
+    RM --> SK
+    PF[/"fused and station predictions<br/>of one learned model"/] --> DAY["Squared errors at horizon h,<br/>summed for each UTC day"]
+    DAY --> BS["500 resamples of whole days,<br/>seed SKYFUSION_SEED"]
+    BS --> DIFF["RMSE fused minus<br/>RMSE station for each resample"]
+    DIFF --> CI[/"Point value and<br/>2.5 and 97.5 percentiles"/]
+```
 
 ---
 
@@ -379,6 +668,37 @@ skyfusion evaluate --dataset data/fused.csv --lstm
 # Real data
 skyfusion fetch-power --start 20010101 --end 20241231
 skyfusion build-dataset --station data/station_openweather.csv --power cache/*.csv --out data/fused.csv
+```
+
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["skyfusion synth"]
+    SYN --> RAW[("data/synthetic/<br/>station_openweather.csv,<br/>power_lst.csv")]
+    FP["skyfusion fetch-power"] --> CA[("cache/power_*_UTC.csv")]
+    RAW --> QC["skyfusion qc<br/>prints the QCReport"]
+    RAW --> BD["skyfusion build-dataset"]
+    CA --> BD
+    BD --> FT[("data/fused.csv")]
+    FT --> EV["skyfusion evaluate<br/>--lstm, --fast, --json"]
+    FT --> FC["skyfusion forecast<br/>--fused"]
+```
+
+The `forecast` command makes one forecast from the last window of the table.
+
+```mermaid
+flowchart TD
+    FT[/"data/fused.csv"/] --> FS{"--fused?"}
+    FS -- "yes" --> FU["fused feature set"]
+    FS -- "no" --> ST["station feature set"]
+    FU --> SM["make_samples, split_by_year"]
+    ST --> SM
+    SM --> FIT["RidgeDirect: fit on train,<br/>alpha from validation"]
+    SM --> LAST["Sample with the<br/>latest origin"]
+    FIT --> PR["predict: change +<br/>last observed value"]
+    LAST --> PR
+    PR --> OUT[/"Temperature for each of<br/>the next H hours, in UTC"/]
 ```
 
 ### 10.4 Environment variables
